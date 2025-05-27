@@ -5,8 +5,9 @@ from .base import BaseAgent
 from .reader import Reader
 from .searcher import Searcher
 from .writer import Writer
+from .cpp_writer import CppWriter
 from .verifier import Verifier
-from visualizer import StatusVisualizer
+from ..visualizer import StatusVisualizer
 import re
 import yaml
 import ast
@@ -32,17 +33,17 @@ class Orchestrator(BaseAgent):
     """Agent responsible for managing the workflow between all other agents."""
     
     def __init__(self, repo_path: str, config_path: Optional[str] = None, test_mode: Optional[str] = None):
-        """Initialize the Orchestrator agent and its sub-agents.
-        
-        Args:
-            repo_path: Path to the repository being analyzed
-            config_path: Optional path to the configuration file
-            test_mode: Optional test mode to run only specific components. Values: "reader_searcher", "context_print" or None
-        """
-        super().__init__("Orchestrator")
+        super().__init__(config_path)
         self.repo_path = repo_path
-        self.context = ""
         self.test_mode = test_mode
+
+        # Initialize context caches
+        self._file_context_cache = {}
+        self._class_context_cache = {}
+        self._method_context_cache = {}
+        self._function_context_cache = {}
+        self._current_class = None
+        self._current_file = None
         
         # Load configuration
         self.config = {}
@@ -76,8 +77,13 @@ class Orchestrator(BaseAgent):
         
         # Only initialize writer and verifier if not in reader_searcher test mode
         if test_mode != "reader_searcher":
-            self.writer = Writer(config_path=config_path)
+            # Initialize both Python and C++ writers
+            self.py_writer = Writer(config_path=config_path)
+            self.cpp_writer = CppWriter(config_path=config_path)
             self.verifier = Verifier(config_path=config_path)
+            
+        # Cache for contexts
+        self.context = ""
 
     def _parse_verifier_response(self, response: str) -> Dict[str, Any]:
         """Parse the verifier's XML response into a structured format.
@@ -101,29 +107,89 @@ class Orchestrator(BaseAgent):
             'context_suggestion': ''
         }
         
-        # Parse NEED_REVISION
-        need_revision_match = re.search(r'<NEED_REVISION>(.*?)</NEED_REVISION>', response, re.DOTALL)
-        if need_revision_match:
-            result['needs_revision'] = need_revision_match.group(1).strip().lower() == 'true'
+        if not response:
+            return result
+
+        try:
+            # Safely parse NEED_REVISION with default to False
+            need_revision_match = re.search(r'<NEED_REVISION>(.*?)</NEED_REVISION>', response, re.DOTALL)
+            result['needs_revision'] = (need_revision_match and 
+                                    need_revision_match.group(1) and 
+                                    need_revision_match.group(1).strip().lower() == 'true')
             
             if result['needs_revision']:
-                # Parse MORE_CONTEXT
+                # Safely parse MORE_CONTEXT with default to False
                 more_context_match = re.search(r'<MORE_CONTEXT>(.*?)</MORE_CONTEXT>', response, re.DOTALL)
-                if more_context_match:
-                    result['needs_context'] = more_context_match.group(1).strip().lower() == 'true'
-                    
-                    if result['needs_context']:
-                        # Extract context suggestion
-                        context_suggestion_match = re.search(r'<SUGGESTION_CONTEXT>(.*?)</SUGGESTION_CONTEXT>', response, re.DOTALL)
-                        if context_suggestion_match:
-                            result['context_suggestion'] = context_suggestion_match.group(1).strip()
-                    else:
-                        # Extract improvement suggestion
-                        suggestion_match = re.search(r'<SUGGESTION>(.*?)</SUGGESTION>', response, re.DOTALL)
-                        if suggestion_match:
-                            result['suggestion'] = suggestion_match.group(1).strip()
-        
+                result['needs_context'] = (more_context_match and 
+                                        more_context_match.group(1) and 
+                                        more_context_match.group(1).strip().lower() == 'true')
+                
+                if result['needs_context']:
+                    # Extract context suggestion with fallback
+                    context_suggestion_match = re.search(r'<SUGGESTION_CONTEXT>(.*?)</SUGGESTION_CONTEXT>', response, re.DOTALL)
+                    result['context_suggestion'] = (context_suggestion_match.group(1).strip() 
+                                                if context_suggestion_match and context_suggestion_match.group(1) 
+                                                else "Additional context needed to improve docstring quality.")
+                else:
+                    # Extract improvement suggestion with fallback
+                    suggestion_match = re.search(r'<SUGGESTION>(.*?)</SUGGESTION>', response, re.DOTALL)
+                    result['suggestion'] = (suggestion_match.group(1).strip()
+                                        if suggestion_match and suggestion_match.group(1)
+                                        else "Please improve the docstring following standard documentation guidelines.")
+        except Exception as e:
+            # Handle any parsing errors gracefully
+            result['needs_revision'] = True
+            result['needs_context'] = False
+            result['suggestion'] = f"Error parsing verification response: {str(e)}. Please review the docstring manually."
+            
         return result
+
+    def _cache_class_context(self, class_name: str, ast_node: ast.AST, ast_tree: ast.AST, dependency_graph: Dict[str, List[str]]) -> None:
+        """Cache context for a class to be reused by its methods.
+        
+        Args:
+            class_name: The name of the class
+            ast_node: The AST node for the class
+            ast_tree: The complete AST tree
+            dependency_graph: The dependency graph
+        """
+        if class_name not in self._class_context_cache:
+            # Get class-level context using searcher
+            class_context = self.searcher.process(
+                f"<REQUEST><INTERNAL><CALLS><CLASS>{class_name}</CLASS></CALLS><CALL_BY>true</CALL_BY></INTERNAL></REQUEST>",
+                ast_node,
+                ast_tree,
+                dependency_graph,
+                class_name
+            )
+            self._class_context_cache[class_name] = class_context
+
+    def _get_cached_context(self, class_name: str, method_specific_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Get combined context from cache and method-specific info.
+        
+        Args:
+            class_name: The name of the class
+            method_specific_context: Context specific to the method
+            
+        Returns:
+            Combined context dictionary
+        """
+        if class_name in self._class_context_cache:
+            # Combine class context with method-specific context
+            combined = dict(self._class_context_cache[class_name])
+            
+            # Only update with method-specific internal info
+            if 'internal' in method_specific_context and 'internal' in combined:
+                # Preserve class-level info while adding method-specific info
+                combined['internal'].update(method_specific_context['internal'])
+            
+            # Always use method-specific external info if present
+            if 'external' in method_specific_context:
+                combined['external'] = method_specific_context['external']
+                
+            return combined
+            
+        return method_specific_context
 
     def process(
         self,
@@ -135,23 +201,50 @@ class Orchestrator(BaseAgent):
         focal_node_dependency_path: str = None,
         token_consume_focal: int = 0
     ) -> str:
-        """Process a docstring generation request through the entire agent workflow.
-        
-        Args:
-            focal_component: The code component needing a docstring (full code snippet)
-            file_path: Path to the file containing the component (Only input relative file path to the belonged repo!)
-            ast_node: Optional AST node representing the focal component
-            ast_tree: Optional AST tree for the entire file
-            
-        Returns:
-            The generated and verified docstring, or reader response in test mode
-        """
-        # Reset visualization and set current component
-        self.visualizer.reset()
+        """Process a code component to generate a docstring."""
+        # Set visualization state
         self.visualizer.set_current_component(focal_component, file_path)
-        # context should be reset to empty string
+        
+        # Cache file-level context first
+        self._current_file = file_path
+        self._cache_file_context(file_path, ast_tree, dependency_graph)
+        
+        # Determine which writer to use based on file extension
+        writer = self.py_writer if not file_path.endswith(('.cpp', '.hpp', '.cc', '.h', '.cxx')) else self.cpp_writer
+        
+        # Determine component type and cache accordingly
+        is_method = '.' in (focal_node_dependency_path or '')
+        if is_method:
+            # Handle class method
+            class_name = focal_node_dependency_path.split('.')[-2]
+            method_name = focal_node_dependency_path.split('.')[-1]
+            
+            # Cache class context if not already cached
+            self._cache_class_context(class_name, ast_node, ast_tree, dependency_graph)
+            self._current_class = class_name
+            
+            # Cache method context
+            if method_name not in self._method_context_cache:
+                self._method_context_cache[method_name] = {}  # Initialize method cache
+            
+            # Combine contexts: file -> class -> method
+            combined_context = self._get_combined_context(file_path, class_name, method_name)
+            if combined_context:
+                self.context = combined_context
+        else:
+            # Handle standalone function
+            self._current_class = None
+            if focal_node_dependency_path:  # If it's a function
+                self._cache_function_context(focal_node_dependency_path, ast_node, ast_tree, dependency_graph)
+                # Combine contexts: file -> function
+                if focal_node_dependency_path in self._function_context_cache:
+                    self.context = self._merge_contexts(
+                        self._file_context_cache.get(file_path, {}),
+                        self._function_context_cache[focal_node_dependency_path]
+                    )
+        
+        # Initialize context and counters
         self.context = ""
-        # Initialize attempt counters
         reader_search_attempts = 0
         verifier_rejection_count = 0
         
@@ -205,6 +298,8 @@ class Orchestrator(BaseAgent):
             while True:  # Inner loop for writer-verifier cycle
                 # Step 3: When enough context is gathered, use Writer to generate docstring
                 self.visualizer.update('writer', "Generating docstring...")
+                if self.test_mode != "context_print":
+                    time.sleep(self.status_sleep_time)
                 
                 # Print context if in context_print test mode
                 if self.test_mode == "context_print":
@@ -212,13 +307,14 @@ class Orchestrator(BaseAgent):
                     print(self.context)
                     print("=== END OF CONTEXT ===\n")
                 
-                docstring = self.writer.process(
+                docstring = writer.process(
                     focal_component,
                     self.context
                 )
+                
                 # assert docstring is not empty
                 # add writer_response to writer's memory (assistant)
-                self.writer.add_to_memory("assistant", docstring)
+                writer.add_to_memory("assistant", docstring)
 
                 # Step 4: Use Verifier to check the quality
                 self.visualizer.update('verifier', "Verifying docstring quality...")
@@ -263,11 +359,15 @@ class Orchestrator(BaseAgent):
                         if self.test_mode != "context_print":
                             time.sleep(self.status_sleep_time)
                         # Add improvement suggestion to writer's memory and continue inner loop
-                        self.writer.add_to_memory(
+                        writer.add_to_memory(
                             "user",
                             f"Please improve the docstring based on this suggestion: {verification_result['suggestion']}"
                         )
-                        # Continue inner loop to generate new docstring
+                        # Clean writer's memory but keep latest improvement suggestion
+                        latest_memory = [writer.memory[-2], writer.memory[-1]] if len(writer.memory) >= 2 else writer.memory
+                        writer.clear_memory()
+                        writer.memory.extend(latest_memory)
+                        continue  # Continue inner loop to generate new docstring
 
     def _update_context(self, search_results: Dict[str, Any], token_consume_focal: int) -> None:
         """Update the context with new search results by merging content within existing XML tags.
@@ -429,5 +529,139 @@ class Orchestrator(BaseAgent):
             self.context = re.sub(pattern, f'<{component_name}>\n{new_content}\n</{component_name}>', self.context, flags=re.DOTALL)
             
         except Exception as e:
-            print(f"Error constraining context length: {e}") 
+            print(f"Error constraining context length: {e}")
+
+    def _cache_file_context(self, file_path: str, ast_tree: ast.AST, dependency_graph: Dict[str, List[str]]) -> None:
+        """Cache context at the file level to be reused by components in the same file.
         
+        Args:
+            file_path: Path to the file
+            ast_tree: The complete AST tree for the file
+            dependency_graph: The dependency graph
+        """
+        if file_path not in self._file_context_cache:
+            # Get file-level context using searcher with a special request
+            file_context = self.searcher.process(
+                f"<REQUEST><INTERNAL><CALLS><FILE>{file_path}</FILE></CALLS><CALL_BY>true</CALL_BY></INTERNAL></REQUEST>",
+                None,  # No specific node for file-level context
+                ast_tree,
+                dependency_graph,
+                file_path
+            )
+            self._file_context_cache[file_path] = file_context
+
+    def _cache_function_context(self, function_name: str, ast_node: ast.AST, ast_tree: ast.AST, dependency_graph: Dict[str, List[str]]) -> None:
+        """Cache context for a function to be reused.
+        
+        Args:
+            function_name: The name of the function
+            ast_node: The AST node for the function 
+            ast_tree: The complete AST tree
+            dependency_graph: The dependency graph
+        """
+        if function_name not in self._function_context_cache:
+            # Get function-level context using searcher
+            function_context = self.searcher.process(
+                f"<REQUEST><INTERNAL><CALLS><FUNCTION>{function_name}</FUNCTION></CALLS><CALL_BY>true</CALL_BY></INTERNAL></REQUEST>",
+                ast_node,
+                ast_tree,
+                dependency_graph,
+                function_name
+            )
+            self._function_context_cache[function_name] = function_context
+
+    def _merge_contexts(self, *contexts: Dict[str, Any]) -> str:
+        """Merge multiple context dictionaries preserving XML structure.
+        
+        Args:
+            *contexts: Variable number of context dictionaries to merge
+            
+        Returns:
+            Merged context string in XML format
+        """
+        merged = {
+            'internal': {
+                'calls': {
+                    'class': {},
+                    'function': {},
+                    'method': {},
+                },
+                'called_by': []
+            },
+            'external': {}
+        }
+        
+        # Merge all contexts
+        for context in contexts:
+            if not context:
+                continue
+                
+            if 'internal' in context:
+                internal = context['internal']
+                if 'calls' in internal:
+                    calls = internal['calls']
+                    for call_type in ['class', 'function', 'method']:
+                        if call_type in calls:
+                            merged['internal']['calls'][call_type].update(calls[call_type])
+                
+                if 'called_by' in internal:
+                    merged['internal']['called_by'].extend(internal['called_by'])
+            
+            if 'external' in context:
+                merged['external'].update(context['external'])
+        
+        # Convert to XML format
+        xml = "<CONTEXT>\n<INTERNAL_INFO>\n"
+        
+        # Add calls
+        for call_type in ['CLASS', 'FUNCTION', 'METHOD']:
+            xml += f"<{call_type}>\n"
+            calls = merged['internal']['calls'][call_type.lower()]
+            for name, content in calls.items():
+                xml += f"<{name}>{content}</{name}>\n"
+            xml += f"</{call_type}>\n"
+        
+        # Add called_by
+        xml += "<CALL_BY>\n"
+        for called_by in merged['internal']['called_by']:
+            xml += f"{called_by}\n"
+        xml += "</CALL_BY>\n"
+        xml += "</INTERNAL_INFO>\n"
+        
+        # Add external info
+        xml += "<EXTERNAL_RETRIEVAL_INFO>\n"
+        for query, result in merged['external'].items():
+            xml += f"<QUERY>{query}</QUERY>\n<r>{result}</r>\n"
+        xml += "</EXTERNAL_RETRIEVAL_INFO>\n"
+        xml += "</CONTEXT>"
+        
+        return xml
+
+    def _get_combined_context(self, file_path: str, class_name: str = None, method_name: str = None) -> Optional[str]:
+        """Get combined context from all caching levels.
+        
+        Args:
+            file_path: The file path
+            class_name: Optional class name
+            method_name: Optional method name
+            
+        Returns:
+            Combined context string or None if no context available
+        """
+        contexts = []
+        
+        # Add file context
+        if file_path in self._file_context_cache:
+            contexts.append(self._file_context_cache[file_path])
+        
+        # Add class context
+        if class_name and class_name in self._class_context_cache:
+            contexts.append(self._class_context_cache[class_name])
+        
+        # Add method context
+        if method_name and method_name in self._method_context_cache:
+            contexts.append(self._method_context_cache[method_name])
+        
+        if contexts:
+            return self._merge_contexts(*contexts)
+        return None

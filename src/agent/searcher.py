@@ -100,6 +100,82 @@ class Searcher(BaseAgent):
             'external': external_info
         }
 
+    def _ensure_valid_xml(self, response: str) -> str:
+        """Ensure XML content has all required tags with valid structure.
+        
+        Args:
+            response: Raw response text potentially containing XML
+            
+        Returns:
+            Valid XML string with all required tags
+        """
+        # If no REQUEST tag found, wrap content
+        if "<REQUEST>" not in response or "</REQUEST>" not in response:
+            xml_content = f"<REQUEST>\n{response}\n</REQUEST>"
+        else:
+            # Extract existing REQUEST content
+            xml_match = re.search(r'<REQUEST>(.*?)</REQUEST>', response, re.DOTALL)
+            xml_content = f'<REQUEST>{xml_match.group(1) if xml_match else ""}</REQUEST>'
+
+        # Parse to see what's missing
+        try:
+            root = ET.fromstring(xml_content)
+            
+            # Check and add INTERNAL if missing
+            internal = root.find('INTERNAL')
+            if internal is None:
+                internal = ET.SubElement(root, 'INTERNAL')
+
+            # Check and add CALLS if missing
+            calls = internal.find('CALLS')
+            if calls is None:
+                calls = ET.SubElement(internal, 'CALLS')
+
+            # Ensure CLASS, FUNCTION, METHOD tags exist
+            for tag in ['CLASS', 'FUNCTION', 'METHOD']:
+                if calls.find(tag) is None:
+                    ET.SubElement(calls, tag)
+
+            # Check and add CALL_BY if missing
+            call_by = internal.find('CALL_BY')
+            if call_by is None:
+                call_by = ET.SubElement(internal, 'CALL_BY')
+                call_by.text = 'false'
+
+            # Check and add RETRIEVAL/QUERY if missing
+            retrieval = root.find('RETRIEVAL')
+            if retrieval is None:
+                retrieval = ET.SubElement(root, 'RETRIEVAL')
+                query = ET.SubElement(retrieval, 'QUERY')
+                query.text = ''
+
+            # Convert back to string
+            return ET.tostring(root, encoding='unicode', method='xml')
+            
+        except ET.ParseError:
+            # If XML is completely invalid, return minimal valid structure
+            return """
+<REQUEST>
+    <INTERNAL>
+        <CALLS>
+            <CLASS></CLASS>
+            <FUNCTION></FUNCTION>
+            <METHOD></METHOD>
+        </CALLS>
+        <CALL_BY>false</CALL_BY>
+    </INTERNAL>
+    <RETRIEVAL>
+        <QUERY></QUERY>
+    </RETRIEVAL>
+</REQUEST>
+"""
+
+    def _parse_comma_list(self, text: str | None) -> List[str]:
+        """Parse comma-separated text into a list, handling None values."""
+        if not text:
+            return []
+        return [x.strip() for x in text.split(',') if x.strip()]
+
     def _parse_reader_response(self, reader_response: str) -> ParsedInfoRequest:
         """Parse the reader's structured XML response.
         
@@ -109,16 +185,10 @@ class Searcher(BaseAgent):
         Returns:
             ParsedInfoRequest object containing structured requests
         """
-        # Extract the XML content between REQUEST tags
-        xml_match = re.search(r'<REQUEST>(.*?)</REQUEST>', 
-                            reader_response, re.DOTALL)
-        if not xml_match:
-            # Return empty request if no valid XML found
-            return ParsedInfoRequest()
-            
-        xml_content = f'<REQUEST>{xml_match.group(1)}</REQUEST>'
-        
         try:
+            # Get valid XML structure 
+            xml_content = self._ensure_valid_xml(reader_response)
+            
             # Parse XML
             root = ET.fromstring(xml_content)
             
@@ -131,12 +201,12 @@ class Searcher(BaseAgent):
                     'function': self._parse_comma_list(calls.find('FUNCTION').text),
                     'method': self._parse_comma_list(calls.find('METHOD').text)
                 },
-                'call_by': internal.find('CALL_BY').text.lower() == 'true'
+                'call_by': internal.find('CALL_BY').text.lower() == 'true' if internal.find('CALL_BY') is not None else False
             }
             
             # Parse external requests
             external = root.find('RETRIEVAL')
-            external_requests = self._parse_comma_list(external.find('QUERY').text)
+            external_requests = self._parse_comma_list(external.find('QUERY').text) if external is not None and external.find('QUERY') is not None else []
             
             return ParsedInfoRequest(
                 internal_requests=internal_requests,
@@ -144,23 +214,12 @@ class Searcher(BaseAgent):
             )
             
         except (ET.ParseError, AttributeError) as e:
-            print(f"Error parsing XML: {e}")
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Error parsing XML in reader response: {str(e)}")
             # Return empty request if XML parsing fails
             return ParsedInfoRequest()
     
-    def _parse_comma_list(self, text: str | None) -> List[str]:
-        """Parse comma-separated text into list of strings.
-        
-        Args:
-            text: Comma-separated text or None
-            
-        Returns:
-            List of non-empty strings
-        """
-        if not text:
-            return []
-        return [item.strip() for item in text.split(',') if item.strip()]
-
     def _gather_internal_info(
         self, 
         ast_node: ast.AST,

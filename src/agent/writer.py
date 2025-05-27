@@ -140,6 +140,30 @@ class Writer(BaseAgent):
         specific_prompt = self.class_prompt if is_class else self.function_prompt
         return specific_prompt
 
+    def _ensure_docstring_format(self, response: str) -> str:
+        """Ensure the response has proper DOCSTRING XML tags.
+        If tags are missing but content looks like a docstring, wrap it.
+        If content is invalid, return empty string.
+        
+        Args:
+            response: Raw response from LLM
+            
+        Returns:
+            Properly formatted docstring with XML tags
+        """
+        # If already has proper tags, return as is
+        if "<DOCSTRING>" in response and "</DOCSTRING>" in response:
+            return response
+
+        # If no tags but looks like a docstring (has indentation, starts with description)
+        lines = response.strip().splitlines()
+        if lines and not any(line.strip().startswith(('<', '/', '<?xml')) for line in lines):
+            # Looks like valid docstring content, wrap it
+            return f"<DOCSTRING>\n{response.strip()}\n</DOCSTRING>"
+
+        # Not valid docstring content
+        return "<DOCSTRING></DOCSTRING>"
+
     def extract_docstring(self, response: str) -> str:
         """Extract the docstring from the LLM response.
         
@@ -149,18 +173,36 @@ class Writer(BaseAgent):
         Returns:
             str: The extracted docstring, or empty string if no docstring found
         """
-        start_tag = "<DOCSTRING>"
-        end_tag = "</DOCSTRING>"
+        if not response:
+            return ""
+
+        response = self._ensure_docstring_format(response)
         
         try:
+            # Find content between DOCSTRING tags
+            start_tag = "<DOCSTRING>"
+            end_tag = "</DOCSTRING>"
             start_idx = response.index(start_tag) + len(start_tag)
             end_idx = response.index(end_tag)
-            return response[start_idx:end_idx].strip()
-        except ValueError:
+            
+            content = response[start_idx:end_idx].strip()
+            if not content:
+                return ""
+
+            # Validate basic docstring structure
+            lines = content.splitlines()
+            if not lines:
+                return ""
+
+            # Remove triple quotes if they exist
+            content = content.strip('"""').strip("'''").strip()
+            return content
+
+        except (ValueError, AttributeError) as e:
             import logging
             logger = logging.getLogger(__name__)
-            logger.warning("\033[93mError parsing, no DOCSTRING XML tags found in response, directly return the response as docstring %s\033[0m")
-            return response
+            logger.warning(f"Error extracting docstring from response: {str(e)}")
+            return ""
 
     def process(
         self,
@@ -202,4 +244,4 @@ class Writer(BaseAgent):
         
         # Extract and return just the docstring part
         return self.extract_docstring(full_response)
-    
+

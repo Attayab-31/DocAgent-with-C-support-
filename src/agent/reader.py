@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+import re
 
 from .base import BaseAgent
 
@@ -126,6 +127,66 @@ class Reader(BaseAgent):
         """
         self.add_to_memory("system", self.system_prompt)
 
+    def _ensure_valid_xml_response(self, response: str) -> str:
+        """Ensure the response has proper XML structure with required tags.
+
+        Args:
+            response: Raw response from LLM
+
+        Returns:
+            Properly formatted response with valid XML structure
+        """
+        # If response is empty or None, return minimal valid structure
+        if not response:
+            return """
+<INFO_NEED>false</INFO_NEED>
+<REQUEST>
+    <INTERNAL>
+        <CALLS>
+            <CLASS></CLASS>
+            <FUNCTION></FUNCTION>
+            <METHOD></METHOD>
+        </CALLS>
+        <CALL_BY>false</CALL_BY>
+    </INTERNAL>
+    <RETRIEVAL>
+        <QUERY></QUERY>
+    </RETRIEVAL>
+</REQUEST>
+"""
+
+        # Ensure INFO_NEED tag exists with valid value
+        info_need_match = re.search(r'<INFO_NEED>(.*?)</INFO_NEED>', response, re.DOTALL)
+        if not info_need_match:
+            response = "<INFO_NEED>false</INFO_NEED>\n" + response
+        elif info_need_match.group(1).strip().lower() not in ['true', 'false']:
+            response = response.replace(
+                info_need_match.group(1),
+                'false'
+            )
+
+        info_need_value = info_need_match and info_need_match.group(1).strip().lower() == 'true' if info_need_match else False
+
+        # If info needed but no REQUEST tag, add minimal structure
+        if info_need_value and "<REQUEST>" not in response:
+            response += """
+<REQUEST>
+    <INTERNAL>
+        <CALLS>
+            <CLASS></CLASS>
+            <FUNCTION></FUNCTION>
+            <METHOD></METHOD>
+        </CALLS>
+        <CALL_BY>false</CALL_BY>
+    </INTERNAL>
+    <RETRIEVAL>
+        <QUERY></QUERY>
+    </RETRIEVAL>
+</REQUEST>
+"""
+
+        return response
+
     def process(self, focal_component: str, context: str = "") -> str:
         """Process the input and determine if more context is needed.
 
@@ -136,7 +197,7 @@ class Reader(BaseAgent):
             context: Current context information (if any)
 
         Returns:
-            A string containing the analysis and <INFO_NEED> tag indicating if more information is needed
+            A string containing the analysis and XML tags indicating if more information is needed
         """
         # Add the current task to memory
         task_description = f"""
@@ -153,6 +214,32 @@ class Reader(BaseAgent):
         """
         self.add_to_memory("user", task_description)
 
-        # Generate response using LLM
-        response = self.generate_response()
-        return response
+        try:
+            # Generate response using LLM
+            response = self.generate_response()
+
+            # Ensure proper XML structure
+            response = self._ensure_valid_xml_response(response)
+
+            return response
+
+        except Exception as e:
+            # Return valid XML even if error occurs
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error in reader process: {str(e)}")
+            return """<INFO_NEED>false</INFO_NEED>
+<REQUEST>
+    <INTERNAL>
+        <CALLS>
+            <CLASS></CLASS>
+            <FUNCTION></FUNCTION>
+            <METHOD></METHOD>
+        </CALLS>
+        <CALL_BY>false</CALL_BY>
+    </INTERNAL>
+    <RETRIEVAL>
+        <QUERY></QUERY>
+    </RETRIEVAL>
+</REQUEST>
+"""

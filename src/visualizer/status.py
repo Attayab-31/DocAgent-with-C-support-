@@ -4,7 +4,7 @@ from colorama import Fore, Back, Style, init
 import sys
 import time
 import ast
-from agent.tool.ast import _get_component_name_from_code
+from ..agent.tool.ast import _get_component_name_from_code
 class StatusVisualizer:
     """Visualizes the workflow status of DocAssist agents in the terminal."""
     

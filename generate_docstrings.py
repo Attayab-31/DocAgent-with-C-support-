@@ -245,20 +245,32 @@ def set_docstring_in_file(file_path: str, component: CodeComponent, docstring: s
         
     Returns:
         True if successful, False otherwise.
-    """    # Handle C++ files
+    """
+    # Handle C++ files
     if file_path.endswith(('.cpp', '.hpp', '.h', '.cxx', '.cc')):
         try:
             from src.dependency_analyzer.cpp_parser import CLANG_AVAILABLE
             if not CLANG_AVAILABLE:
                 logger.error("Cannot edit C++ files - clang not available. Please install LLVM and clang.")
                 return False
-                
+
             from src.dependency_analyzer.cpp_docstring import insert_cpp_docstring
-            return insert_cpp_docstring(file_path, docstring, component.start_line)
+
+            # Validate start_line
+            if component.start_line <= 0:
+                logger.error(f"Invalid start line for component {component.id}: {component.start_line}")
+                return False
+
+            # Insert the docstring
+            success = insert_cpp_docstring(file_path, docstring, component.start_line)
+            if not success:
+                logger.error(f"Failed to insert docstring for component {component.id} in file {file_path}")
+            return success
+
         except ImportError as e:
             logger.error(f"Error importing C++ modules: {e}")
             return False
-            
+
     # Handle Python files
     # Read the file
     with open(file_path, "r", encoding="utf-8") as f:
@@ -453,6 +465,17 @@ def main():
         action='store_true',
         help='Overwrite existing docstrings instead of skipping them (default: False)'
     )
+    parser.add_argument(
+        '--parallel',
+        action='store_true',
+        help='Enable parallel processing of independent components'
+    )
+    parser.add_argument(
+        '--max-workers',
+        type=int,
+        default=None,
+        help='Maximum number of parallel workers (defaults to CPU count)'
+    )
     
     args = parser.parse_args()
     repo_path = args.repo_path
@@ -551,38 +574,82 @@ def main():
     # Show dependency statistics
     visualizer.show_dependency_stats()
     
-    # Process components
-    for component_id in sorted_components:
-        component = components.get(component_id)
-        if not component:
-            continue
-
-        # Skip __init__ methods
-        if component.component_type == "method" and component_id.endswith(".__init__"):
-            visualizer.update(component_id, "completed")
-            continue
-
-        # Check if we should skip this component
-        docstring_length = len(component.docstring.split()) if component.has_docstring else 0
-        if component.has_docstring and not overwrite_docstrings and docstring_length > 10:
-            visualizer.update(component_id, "completed")
-            continue
-
-        # Generate docstring
-        visualizer.update(component_id, "processing")
-        print(f"\nProcessing: {component_id}")
+    # Initialize parallel processor if enabled
+    parallel_processor = None
+    if args.parallel:
+        from src.agent.parallel_processor import ParallelProcessor
         
-        docstring = generate_docstring_for_component(component, orchestrator, test_mode, dependency_graph)
-        success = set_docstring_in_file(component.file_path, component, docstring)
+        parallel_processor = ParallelProcessor(
+            repo_path=repo_path,
+            config_path=config_path,
+            max_workers=args.max_workers
+        )
         
-        visualizer.update(component_id, "completed" if success else "error")
-        if not success:
-            logger.error(f"Failed to generate docstring for {component_id}")
+        # Get dependency levels for parallel processing
+        dependency_levels = parallel_processor.get_dependency_levels(dependency_graph)
+        logger.info(f"Components grouped into {len(dependency_levels)} dependency levels")
         
-        # Re-parse if needed for line number updates
-        if [c for c in sorted_components if c != component_id and components[c].file_path == component.file_path]:
-            parser = DependencyParser(repo_path)
-            components.update(parser.parse_repository())
+        # Process each level in parallel
+        ast_trees = {}
+        for comp_id in sorted_components:
+            comp = components[comp_id]
+            if comp.file_path not in ast_trees:
+                try:
+                    with open(comp.file_path, 'r', encoding='utf-8') as f:
+                        # Check file type and parse accordingly
+                        if comp.file_path.endswith('.cpp') or comp.file_path.endswith('.hpp'):
+                            from src.dependency_analyzer.cpp_parser import parse_cpp_file
+                            ast_trees[comp.file_path] = parse_cpp_file(comp.file_path)
+                        else:
+                            # Default to Python parsing
+                            ast_trees[comp.file_path] = ast.parse(f.read())
+                except Exception as e:
+                    logger.error(f"Error parsing file {comp.file_path}: {str(e)}")
+                    ast_trees[comp.file_path] = None  # Mark as failed to parse
+        
+        for level_idx, level_components in enumerate(dependency_levels):
+            logger.info(f"Processing level {level_idx + 1}/{len(dependency_levels)} with {len(level_components)} components")
+            results = parallel_processor.process_level(components, ast_trees, dependency_graph, level_components)
+            
+            # Update docstrings for this level
+            for comp_id, docstring in results.items():
+                if docstring:
+                    component = components[comp_id]
+                    success = set_docstring_in_file(component.file_path, component, docstring)
+                    visualizer.update(comp_id, "completed" if success else "error")
+    else:
+        # Process components sequentially
+        for component_id in sorted_components:
+            component = components.get(component_id)
+            if not component:
+                continue
+
+            # Skip __init__ methods
+            if component.component_type == "method" and component_id.endswith(".__init__"):
+                visualizer.update(component_id, "completed")
+                continue
+
+            # Check if we should skip this component
+            docstring_length = len(component.docstring.split()) if component.has_docstring else 0
+            if component.has_docstring and not overwrite_docstrings and docstring_length > 10:
+                visualizer.update(component_id, "completed")
+                continue
+
+            # Generate docstring
+            visualizer.update(component_id, "processing")
+            print(f"\nProcessing: {component_id}")
+            
+            docstring = generate_docstring_for_component(component, orchestrator, test_mode, dependency_graph)
+            success = set_docstring_in_file(component.file_path, component, docstring)
+            
+            visualizer.update(component_id, "completed" if success else "error")
+            if not success:
+                logger.error(f"Failed to generate docstring for {component_id}")
+            
+            # Re-parse if needed for line number updates
+            if [c for c in sorted_components if c != component_id and components[c].file_path == component.file_path]:
+                parser = DependencyParser(repo_path)
+                components.update(parser.parse_repository())
     
     # Finalize visualization
     visualizer.finalize()

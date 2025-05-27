@@ -2,78 +2,79 @@
   "add_function.analyze_numbers": {
     "id": "add_function.analyze_numbers",
     "component_type": "function",
-    "file_path": "D:\\Sent to Git Milestone 1\\DocAgent\\data\\testrepo\\add_function.py",
+    "file_path": "data/testrepo\\add_function.py",
     "relative_path": "add_function.py",
     "depends_on": [],
     "start_line": 1,
     "end_line": 11,
     "has_docstring": false,
     "docstring": "",
-    "language": "python"
+    "language": "python",
+    "source_code": "def analyze_numbers():\n\n    numbers = list(map(float, input('Enter numbers separated by space: ').split()))\n    average = sum(numbers) / len(numbers)\n    for num in numbers:\n        if num > average:\n            print(f'{num} is above average')\n        elif num < average:\n            print(f'{num} is below average')\n        else:\n            print(f'{num} is equal to the average')"
   },
-  "subtract.calculate_sum": {
-    "id": "subtract.calculate_sum",
+  "subtract.cpp::calculate_sum::FUNCTION_DECL": {
+    "id": "subtract.cpp::calculate_sum::FUNCTION_DECL",
     "component_type": "function",
-    "file_path": "D:\\Sent to Git Milestone 1\\DocAgent\\data\\testrepo\\subtract.cpp",
+    "file_path": "data/testrepo\\subtract.cpp",
     "relative_path": "subtract.cpp",
     "depends_on": [],
-    "start_line": 3,
-    "end_line": 5,
-    "has_docstring": false,
-    "docstring": "",
+    "start_line": 4,
+    "end_line": 6,
+    "has_docstring": true,
+    "docstring": null,
     "language": "cpp",
     "source_code": "int calculate_sum(int a, int b) {\n    return a + b;\n}\n"
   },
-  "subtract.Calculator": {
-    "id": "subtract.Calculator",
+  "subtract.cpp::Calculator::CLASS_DECL": {
+    "id": "subtract.cpp::Calculator::CLASS_DECL",
     "component_type": "class",
-    "file_path": "D:\\Sent to Git Milestone 1\\DocAgent\\data\\testrepo\\subtract.cpp",
+    "file_path": "data/testrepo\\subtract.cpp",
     "relative_path": "subtract.cpp",
     "depends_on": [],
-    "start_line": 7,
-    "end_line": 26,
-    "has_docstring": false,
-    "docstring": "",
+    "start_line": 9,
+    "end_line": 22,
+    "has_docstring": true,
+    "docstring": null,
     "language": "cpp",
-    "source_code": "class Calculator {\nprivate:\n    int value;\n\npublic:\n    Calculator() : value(0) {}\n\n    void add(int x) {\n        value += x;\n    }\n\n   \n    void subtract(int x) {\n        value -= x;\n    }\n   \n    int get_value() const {\n        return value;\n    }\n};"
+    "source_code": "class Calculator {\nprivate:\n    int value;\n\n void add(int x) {\n        value += x;\n    }\n    void subtract(int x) {\n        value -= x;\n    }\n  int get_value() const {\n        return value;\n    }\n};"
   },
-  "subtract.Calculator.add": {
-    "id": "subtract.Calculator.add",
+  "subtract.cpp::Calculator::add::CXX_METHOD": {
+    "id": "subtract.cpp::Calculator::add::CXX_METHOD",
     "component_type": "method",
-    "file_path": "D:\\Sent to Git Milestone 1\\DocAgent\\data\\testrepo\\subtract.cpp",
+    "file_path": "data/testrepo\\subtract.cpp",
     "relative_path": "subtract.cpp",
     "depends_on": [],
-    "start_line": 14,
-    "end_line": 16,
-    "has_docstring": false,
-    "docstring": "",
+    "start_line": 13,
+    "end_line": 15,
+    "has_docstring": true,
+    "docstring": null,
     "language": "cpp",
-    "source_code": "    void add(int x) {\n        value += x;\n    }\n"
+    "source_code": " void add(int x) {\n        value += x;\n    }\n"
   },
-  "subtract.Calculator.subtract": {
-    "id": "subtract.Calculator.subtract",
+  "subtract.cpp::Calculator::subtract::CXX_METHOD": {
+    "id": "subtract.cpp::Calculator::subtract::CXX_METHOD",
     "component_type": "method",
-    "file_path": "D:\\Sent to Git Milestone 1\\DocAgent\\data\\testrepo\\subtract.cpp",
+    "file_path": "data/testrepo\\subtract.cpp",
+    "relative_path": "subtract.cpp",
+    "depends_on": [],
+    "start_line": 16,
+    "end_line": 18,
+    "has_docstring": true,
+    "docstring": null,
+    "language": "cpp",
+    "source_code": "    void subtract(int x) {\n        value -= x;\n    }\n"
+  },
+  "subtract.cpp::Calculator::get_value::CXX_METHOD": {
+    "id": "subtract.cpp::Calculator::get_value::CXX_METHOD",
+    "component_type": "method",
+    "file_path": "data/testrepo\\subtract.cpp",
     "relative_path": "subtract.cpp",
     "depends_on": [],
     "start_line": 19,
     "end_line": 21,
-    "has_docstring": false,
-    "docstring": "",
+    "has_docstring": true,
+    "docstring": null,
     "language": "cpp",
-    "source_code": "    void subtract(int x) {\n        value -= x;\n    }\n"
-  },
-  "subtract.Calculator.get_value": {
-    "id": "subtract.Calculator.get_value",
-    "component_type": "method",
-    "file_path": "D:\\Sent to Git Milestone 1\\DocAgent\\data\\testrepo\\subtract.cpp",
-    "relative_path": "subtract.cpp",
-    "depends_on": [],
-    "start_line": 23,
-    "end_line": 25,
-    "has_docstring": false,
-    "docstring": "",
-    "language": "cpp",
-    "source_code": "    int get_value() const {\n        return value;\n    }\n"
+    "source_code": "  int get_value() const {\n        return value;\n    }\n"
   }
 }

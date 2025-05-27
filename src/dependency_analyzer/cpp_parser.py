@@ -1,3 +1,4 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates
 """
 C++ code parser that extracts dependency information between code components.
 
@@ -13,6 +14,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, Any, Union
 from pathlib import Path
+from .cpp_docstring import has_docstring
 
 logger = logging.getLogger(__name__)
 
@@ -22,18 +24,35 @@ CursorKind = None
 TokenKind = None
 Index = None
 
+# Try to load libclang from environment variable or common locations
 try:
     import clang.cindex
-    LLVM_PATH = r"C:\Program Files\LLVM"
-    LIBCLANG_PATH = os.path.join(LLVM_PATH, "bin", "libclang.dll")
-
-    if os.path.exists(LIBCLANG_PATH):
-        clang.cindex.Config.set_library_file(LIBCLANG_PATH)
-        from clang.cindex import CursorKind, TokenKind, Index
-        CLANG_AVAILABLE = True
-        logger.info("Successfully initialized libclang")
+    libclang_path = os.environ.get('LIBCLANG_PATH')
+    tried_paths = []
+    if libclang_path and os.path.exists(libclang_path):
+        clang.cindex.Config.set_library_file(libclang_path)
+        tried_paths.append(libclang_path)
     else:
-        logger.error(f"libclang.dll not found at {LIBCLANG_PATH}")
+        # Try common Windows locations
+        possible_paths = [
+            r"C:\Program Files\LLVM\bin\libclang.dll",
+            r"C:\msys64\mingw64\bin\libclang.dll",
+            r"C:\Program Files (x86)\LLVM\bin\libclang.dll",
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                clang.cindex.Config.set_library_file(path)
+                tried_paths.append(path)
+                break
+    from clang.cindex import CursorKind, TokenKind, Index, TranslationUnit
+    # Try to create an Index to verify clang works
+    try:
+        _test_index = Index.create()
+        CLANG_AVAILABLE = True
+        logger.info(f"Successfully initialized libclang from: {tried_paths[-1] if tried_paths else 'default search'}")
+    except Exception as e:
+        logger.error(f"libclang found but could not create Index: {e}")
+        CLANG_AVAILABLE = False
 except ImportError:
     logger.error("clang module not found. Please install: pip install clang")
     CLANG_AVAILABLE = False
@@ -44,33 +63,70 @@ except Exception as e:
 def _extract_docstring(cursor) -> Optional[str]:
     """Extract docstring from comments before the declaration."""
     if not CLANG_AVAILABLE:
+        # Fallback to using the has_docstring function
+        source_code = cursor.translation_unit.spelling  # Assuming this retrieves the source code
+        if has_docstring(source_code):
+            return "Detected docstring using fallback logic."
         return None
-        
+
     try:
-        tokens = list(cursor.get_tokens())
+        start_loc = cursor.extent.start
+        if not start_loc.file:
+            return None
+
+        # Find comments before the declaration
+        tokens = []
+        prev_line = -1
+
+        # Get all tokens before our cursor's start line
+        tu = cursor.translation_unit
+        for token in tu.cursor.get_tokens():
+            if not token.location.file:
+                continue
+
+            if token.location.file.name == start_loc.file.name:
+                if token.extent.end.line < start_loc.line:
+                    # Only consider comment tokens
+                    if token.kind.name == 'COMMENT':
+                        # Check if this is part of a continuous comment block
+                        if prev_line == -1 or token.extent.start.line == prev_line + 1:
+                            # Store the comment and its line number
+                            tokens.append((token.spelling, token.extent.start.line))
+                        else:
+                            # Start a new comment block
+                            tokens = [(token.spelling, token.extent.start.line)]
+                        prev_line = token.extent.end.line
+
+                elif token.extent.start.line >= start_loc.line:
+                    break
+
         if not tokens:
             return None
 
-        # Look for comments before the declaration
-        comments = []
-        for token in tokens:
-            if token.kind == TokenKind.COMMENT:
-                comment_text = token.spelling
-                # Clean up comment markers
-                comment_text = comment_text.replace('/*', '').replace('*/', '').replace('//', '')
-                comment_text = '\n'.join(line.strip() for line in comment_text.split('\n'))
-                comments.append(comment_text)
-            else:
-                break
+        # Process the comments
+        docstring_parts = []
+        for comment, _ in tokens:
+            # Clean up the comment markers and whitespace
+            cleaned = comment.strip()
+            if cleaned.startswith('/*'):
+                cleaned = cleaned[2:]
+            if cleaned.endswith('*/'):
+                cleaned = cleaned[:-2]
+            if cleaned.startswith('//'):
+                cleaned = cleaned[2:]
+            cleaned = cleaned.strip()
 
-        return '\n'.join(comments) if comments else None
+            if cleaned:
+                docstring_parts.append(cleaned)
+
+        return '\n'.join(docstring_parts) if docstring_parts else None
+
     except Exception as e:
         logger.error(f"Error extracting docstring: {e}")
         return None
 
 @dataclass
 class CppComponent:
-    """Represents a C++ code component (function, class, or method)."""
     id: str
     component_type: str  # 'function', 'class', or 'method'  
     file_path: str
@@ -82,9 +138,7 @@ class CppComponent:
     docstring: str = ""
     language: str = "cpp"
     source_code: str = ""  # Added source_code attribute
-
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to a JSON-serializable dictionary."""
         return {
             'id': self.id,
             'component_type': self.component_type,
@@ -98,10 +152,8 @@ class CppComponent:
             'language': self.language,
             'source_code': self.source_code
         }
-
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'CppComponent':
-        """Create a CppComponent from a dictionary."""
         component = cls(
             id=data['id'],
             component_type=data['component_type'],
@@ -114,346 +166,268 @@ class CppComponent:
         component.has_docstring = data['has_docstring']
         component.docstring = data['docstring']
         component.language = data.get('language', 'cpp')
-        component.source_code = data.get('source_code', '')  # Added source_code handling
+        component.source_code = data.get('source_code', '')
         return component
 
 class CppParser:
-    """Parser for C++ files that uses clang to build an AST and extract dependency information."""
-
+    """Parser for C++ source files using libclang."""
+    
     def __init__(self, repo_path: str):
-        """Initialize the C++ parser."""
-        self.repo_path = os.path.abspath(repo_path)
-        self.components: Dict[str, CppComponent] = {}
-        logger.info("Initialized C++ parser with repo path: %s", self.repo_path)
-
-    def parse_file(self, file_path: str) -> Dict[str, CppComponent]:
-        """Parse a C++ file to collect components and their dependencies."""
-        if not CLANG_AVAILABLE:
-            logger.error("clang module not available")
-            return {}
-
-        try:
-            # Get relative path for component IDs
-            relative_path = os.path.relpath(file_path, self.repo_path)
-            module_path = relative_path.replace('/', '.').replace('\\', '.').rsplit('.', 1)[0]
-            logger.info("Parsing C++ file: %s (module path: %s)", relative_path, module_path)
-
-            # Parse the file with clang
-            logger.debug("Creating clang Index")
-            index = Index.create()
-            logger.debug("Parsing translation unit")
-            args = ['-x', 'c++', '-std=c++11']  # Add C++ flags
-            translation_unit = index.parse(file_path, args=args)
-
-            if not translation_unit:
-                logger.error("Failed to parse translation unit")
-                return {}
-
-            logger.debug("Successfully parsed translation unit")
-
-            # Reset components dict for this file
-            self.components = {}
-            
-            # Visit all nodes in the AST
-            logger.debug("Starting AST traversal with cursor kind: %s", str(translation_unit.cursor.kind))
-            self._visit_ast(translation_unit.cursor, file_path, relative_path, module_path)
-            
-            logger.info("Successfully parsed %d components from %s", len(self.components), relative_path)
-            return self.components
-            
-        except Exception as e:
-            logger.error("Error parsing C++ file %s: %s", file_path, str(e))
-            return {}
-            
-    def _visit_ast(self, cursor, file_path: str, relative_path: str, module_path: str) -> None:
-        """Process each node in the clang AST."""
-        try:
-            # Special handling for translation unit cursor
-            if cursor.kind == CursorKind.TRANSLATION_UNIT:
-                logger.debug("Processing translation unit cursor")
-                for child in cursor.get_children():
-                    self._visit_ast(child, file_path, relative_path, module_path)
-                return
-            
-            # For non-translation unit cursors, check file matching
-            cursor_file = cursor.location.file
-            if not cursor_file:
-                logger.debug("Cursor has no associated file")
-                return
-                
-            # Normalize paths for comparison
-            cursor_path = os.path.abspath(cursor_file.name)
-            file_path = os.path.abspath(file_path)
-            if cursor_path != file_path:
-                logger.debug("Skipping cursor from different file: %s != %s", cursor_path, file_path)
-                return
-
-            logger.debug("Processing cursor - Kind: %s, Spelling: '%s', Location: line %d", 
-                       str(cursor.kind), cursor.spelling, cursor.location.line)
-
-            # Handle different types of declarations
-            if cursor.is_definition():
-                if cursor.kind == CursorKind.FUNCTION_DECL:
-                    logger.debug("Found function definition: %s", cursor.spelling)
-                    component = self._process_function(cursor, file_path, relative_path, module_path)
-                    if component:
-                        logger.debug("Adding function component: %s", component.id)
-                        self.components[component.id] = component
-
-                elif cursor.kind == CursorKind.CLASS_DECL:
-                    logger.debug("Found class definition: %s", cursor.spelling)
-                    component = self._process_class(cursor, file_path, relative_path, module_path)
-                    if component:
-                        logger.debug("Adding class component: %s", component.id)
-                        self.components[component.id] = component
-
-                elif cursor.kind == CursorKind.CXX_METHOD:
-                    logger.debug("Found method definition: %s", cursor.spelling)
-                    component = self._process_method(cursor, file_path, relative_path, module_path)
-                    if component:
-                        logger.debug("Adding method component: %s", component.id)
-                        self.components[component.id] = component
-
-            # Recursively visit children
-            for child in cursor.get_children():
-                self._visit_ast(child, file_path, relative_path, module_path)
-
-        except Exception as e:
-            logger.error("Error visiting AST node: %s", str(e))
-
-    def _get_source_code(self, cursor) -> str:
-        """Extract source code for a cursor using its source range."""
-        try:
-            file = cursor.extent.start.file
-            if not file:
-                return ""
-            
-            # Get the start and end line numbers
-            start_line = cursor.extent.start.line 
-            end_line = cursor.extent.end.line
-            
-            # Read those lines from the file
-            with open(file.name, 'r', encoding='utf-8') as f:
-                content = f.readlines()
-                
-            # Extract the lines for this cursor (convert from 1-based to 0-based indexing)
-            source_lines = content[start_line-1:end_line]
-            return ''.join(source_lines)
-            
-        except Exception as e:
-            logger.error(f"Error extracting source code: {e}")
-            return ""
-
-    def _process_function(self, cursor, file_path: str, relative_path: str, module_path: str) -> Optional[CppComponent]:
-        """Process a C++ function declaration."""
-        try:
-            start_line = cursor.extent.start.line
-            end_line = cursor.extent.end.line
-
-            # Skip declarations without bodies
-            if start_line == end_line:
-                logger.debug("Skipping function without body: %s", cursor.spelling)
-                return None
-
-            function_name = cursor.spelling
-            logger.info("Processing function: %s (lines %d-%d)", function_name, start_line, end_line)
-
-            # Create component ID
-            component_id = f"{module_path}.{function_name}"
-
-            # Extract docstring from comments
-            docstring = _extract_docstring(cursor)
-            has_docstring = bool(docstring)
-
-            # Extract source code
-            source_code = self._get_source_code(cursor)
-
-            # Create component
-            component = CppComponent(
-                id=component_id,
-                component_type="function",
-                file_path=file_path,
-                relative_path=relative_path,
-                depends_on=set(),
-                start_line=start_line,
-                end_line=end_line,
-                has_docstring=has_docstring,
-                docstring=docstring or "",
-                language="cpp",
-                source_code=source_code
-            )
-
-            logger.info("Added C++ function component: %s", component_id)
-            return component
-
-        except Exception as e:
-            logger.error("Error processing function %s: %s", cursor.spelling, str(e))
-            return None
-
-    def _process_class(self, cursor, file_path: str, relative_path: str, module_path: str) -> Optional[CppComponent]:
-        """Process a C++ class declaration."""
-        try:
-            class_name = cursor.spelling
-            start_line = cursor.extent.start.line
-            end_line = cursor.extent.end.line
-
-            # Skip forward declarations
-            if start_line == end_line:
-                logger.debug("Skipping class forward declaration: %s", class_name)
-                return None
-
-            logger.info("Processing class: %s (lines %d-%d)", class_name, start_line, end_line)
-
-            # Create component ID
-            component_id = f"{module_path}.{class_name}"
-
-            # Extract docstring from comments
-            docstring = _extract_docstring(cursor)
-            has_docstring = bool(docstring)
-
-            # Extract source code
-            source_code = self._get_source_code(cursor)
-
-            # Create component
-            component = CppComponent(
-                id=component_id,
-                component_type="class",
-                file_path=file_path,
-                relative_path=relative_path,
-                depends_on=set(),
-                start_line=start_line,
-                end_line=end_line,
-                has_docstring=has_docstring,
-                docstring=docstring or "",
-                language="cpp",
-                source_code=source_code
-            )
-
-            logger.info("Added C++ class component: %s", component_id)
-            return component
-
-        except Exception as e:
-            logger.error("Error processing class %s: %s", cursor.spelling, str(e))
-            return None
-
-    def _process_method(self, cursor, file_path: str, relative_path: str, module_path: str) -> Optional[CppComponent]:
-        """Process a C++ method declaration."""
-        try:
-            start_line = cursor.extent.start.line
-            end_line = cursor.extent.end.line
-
-            # Skip method declarations without bodies
-            if start_line == end_line:
-                logger.debug("Skipping method without body: %s", cursor.spelling)
-                return None
-
-            method_name = cursor.spelling
-            class_name = cursor.semantic_parent.spelling
-            logger.info("Processing method: %s::%s (lines %d-%d)", class_name, method_name, start_line, end_line)
-
-            # Create component ID
-            component_id = f"{module_path}.{class_name}.{method_name}"
-
-            # Extract docstring from comments
-            docstring = _extract_docstring(cursor)
-            has_docstring = bool(docstring)
-
-            # Extract source code
-            source_code = self._get_source_code(cursor)
-
-            # Create component
-            component = CppComponent(
-                id=component_id,
-                component_type="method",
-                file_path=file_path,
-                relative_path=relative_path,
-                depends_on=set(),
-                start_line=start_line,
-                end_line=end_line,
-                has_docstring=has_docstring,
-                docstring=docstring or "",
-                language="cpp",
-                source_code=source_code
-            )
-
-            logger.info("Added C++ method component: %s", component_id)
-            return component
-
-        except Exception as e:
-            logger.error("Error processing method %s: %s", cursor.spelling, str(e))
-            return None
-
-    def _resolve_component_dependencies(self, component: CppComponent) -> None:
-        """
-        Resolve dependencies for a C++ component using clang AST.
+        """Initialize the C++ parser.
         
         Args:
-            component: The C++ component to analyze for dependencies
+            repo_path: Path to the repository root
         """
-        try:
-            import clang.cindex as cindex
-            clang.cindex.Config.set_library_file(r"C:\Program Files\LLVM\bin\libclang.dll")
+        self.repo_path = repo_path
+        self._init_clang()
+        self.components = {}
+        
+    def _init_clang(self):
+        """Initialize clang with system includes."""
+        if not CLANG_AVAILABLE:
+            return
+            
+        # Add common system include paths
+        self.clang_args = [
+            "-xc++",  # Force C++ mode
+            "-std=c++14",  # Use C++14 standard
+            "-I/usr/include",
+            "-I/usr/local/include",
+        ]
+        
+        # Add MSVC include paths on Windows
+        if os.name == 'nt':
+            msvc_paths = [
+                "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.30.30705/include",
+                "C:/Program Files (x86)/Windows Kits/10/Include/10.0.19041.0/ucrt",
+            ]
+            for path in msvc_paths:
+                if os.path.exists(path):
+                    self.clang_args.extend(["-I", path])
 
-            # Parse the file
-            index = cindex.Index.create()
-            translation_unit = index.parse(component.file_path)
+    def parse_file(self, file_path: str, repo_path: str = None) -> List[Dict[str, Any]]:
+        """
+        Parse a C++ file and extract components and their dependencies.
+        
+        Args:
+            file_path: Path to the C++ file to parse
+            repo_path: Optional path to the repository root. If not provided,
+                      will use the parent directory of the file.
+        
+        Returns:
+            List of components found in the file
+        """
+        if not CLANG_AVAILABLE:
+            logger.error("Clang not available - cannot parse C++ files")
+            return []
+
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return []
             
-            # Find the cursor for this component
-            cursor = self._find_component_cursor(translation_unit.cursor, component)
-            if not cursor:
-                return
-            
-            # Collect dependencies
-            dependencies = set()
-            
-            # Process references in the cursor
-            for child in cursor.walk_preorder():
-                if child.referenced and child.referenced.location.file:
-                    ref_path = child.referenced.location.file.name
-                    if ref_path.startswith(self.repo_path):
-                        # Convert file path to module path
-                        relative_path = os.path.relpath(ref_path, self.repo_path)
-                        module_path = relative_path.replace('/', '.').replace('\\', '.')
+        # Calculate relative path from repo root
+        if repo_path is None:
+            repo_path = os.path.dirname(file_path)
+        relative_path = os.path.relpath(file_path, repo_path)
+        
+        try:
+            index = Index.create()
+            tu = index.parse(file_path)
+            if not tu:
+                logger.error(f"Failed to parse {file_path}")
+                return []
+                
+            components = []
+            for cursor in tu.cursor.walk_preorder():
+                if cursor.kind in [CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD, 
+                                 CursorKind.CLASS_DECL, CursorKind.CONSTRUCTOR]:
+                    component = self._extract_component(cursor, file_path, relative_path)
+                    if component:
+                        components.append(component)
                         
-                        # Get referenced component name
-                        ref_name = child.referenced.spelling
-                        if child.referenced.semantic_parent:
-                            parent_name = child.referenced.semantic_parent.spelling
-                            if parent_name:
-                                ref_name = f"{parent_name}.{ref_name}"
-                        
-                        dependency = f"{module_path}.{ref_name}"
-                        dependencies.add(dependency)
-            
-            # Update component dependencies
-            component.depends_on.update(dependencies)
+            return components
             
         except Exception as e:
-            logger.error(f"Error resolving dependencies for {component.id}: {e}")
+            logger.error(f"Error parsing {file_path}: {str(e)}")
+            return []
 
-    def _find_component_cursor(self, cursor, component: CppComponent):
-        """Find the cursor corresponding to a component in the AST."""
-        if cursor.location.file and cursor.location.file.name == component.file_path:
-            if cursor.extent.start.line == component.start_line:
-                return cursor
+    def _process_node(self, cursor, file_path: str, relative_path: str):
+        """Process a node in the AST and identify components."""
+        try:
+            if cursor.location.file and cursor.location.file.name == file_path:
+                # Handle functions
+                if cursor.kind == CursorKind.FUNCTION_DECL:
+                    self._add_function(cursor, file_path, relative_path)
                 
-            # Check if this is the component we're looking for
-            if component.component_type == "class" and cursor.kind == CursorKind.CLASS_DECL:
-                if cursor.spelling == component.id.split('.')[-1]:
-                    return cursor
-            elif component.component_type == "function" and cursor.kind == CursorKind.FUNCTION_DECL:
-                if cursor.spelling == component.id.split('.')[-1]:
-                    return cursor
-            elif component.component_type == "method" and cursor.kind == CursorKind.CXX_METHOD:
-                method_name = component.id.split('.')[-1]
-                class_name = component.id.split('.')[-2]
-                if cursor.spelling == method_name and cursor.semantic_parent.spelling == class_name:
-                    return cursor
-        
-        # Recurse through children
+                # Handle classes
+                elif cursor.kind == CursorKind.CLASS_DECL:
+                    self._add_class(cursor, file_path, relative_path)
+                    
+                    # Process class methods and members
+                    self._process_class_members(cursor, cursor.spelling, file_path, relative_path)
+
+            # Recursively process children
+            for child in cursor.get_children():
+                self._process_node(child, file_path, relative_path)
+
+        except Exception as e:
+            logger.error(f"Error processing node: {e}")
+
+    def _process_class_members(self, cursor, class_name: str, file_path: str, relative_path: str):
+        """Process class members (methods and variables) recursively."""
         for child in cursor.get_children():
-            result = self._find_component_cursor(child, component)
-            if result:
-                return result
+            if child.kind in (CursorKind.FIELD_DECL, CursorKind.VAR_DECL):
+                # Handle class member variables
+                self._add_member_variable(child, class_name, file_path, relative_path)
+            elif child.kind in (CursorKind.CXX_METHOD, CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR):
+                # Handle class methods
+                self._add_method(child, class_name, file_path, relative_path)
+
+    def _add_function(self, cursor, file_path: str, relative_path: str):
+        """Add a function component."""
+        component = CppComponent(
+            id=f"{relative_path}::{cursor.spelling}::FUNCTION_DECL",
+            component_type="function",
+            file_path=file_path,
+            relative_path=relative_path
+        )
+        self._set_component_details(component, cursor)
+        self.components[component.id] = component
+
+    def _add_class(self, cursor, file_path: str, relative_path: str):
+        """Add a class component."""
+        component = CppComponent(
+            id=f"{relative_path}::{cursor.spelling}::CLASS_DECL",
+            component_type="class",
+            file_path=file_path,
+            relative_path=relative_path
+        )
+        self._set_component_details(component, cursor)
+        self.components[component.id] = component
+
+    def _add_method(self, cursor, class_name: str, file_path: str, relative_path: str):
+        """Add a method component."""
+        component = CppComponent(
+            id=f"{relative_path}::{class_name}::{cursor.spelling}::METHOD",
+            component_type="method",
+            file_path=file_path,
+            relative_path=relative_path
+        )
+        self._set_component_details(component, cursor)
+        self.components[component.id] = component
+
+    def _add_member_variable(self, cursor, class_name: str, file_path: str, relative_path: str):
+        """Add a class member variable component."""
+        component = CppComponent(
+            id=f"{relative_path}::{class_name}::{cursor.spelling}::MEMBER_VAR",
+            component_type="member_variable",
+            file_path=file_path,
+            relative_path=relative_path
+        )
+        self._set_component_details(component, cursor)
+        self.components[component.id] = component
         
-        return None
+    def _set_component_details(self, component: CppComponent, cursor):
+        """Set common details for a component."""
+        try:
+            # Get accurate source locations
+            start = cursor.extent.start
+            end = cursor.extent.end
+            
+            # Convert to 1-based line numbers as used by the rest of the system
+            component.start_line = start.line
+            component.end_line = end.line
+            
+            # Get the exact source code
+            component.source_code = self._get_source_between_locations(
+                cursor.location.file.name,
+                start.line,
+                end.line
+            )
+            
+            # Check for and extract docstring
+            if has_docstring(component.source_code):
+                component.has_docstring = True
+                component.docstring = _extract_docstring(cursor) or ""
+            else:
+                component.has_docstring = False
+                component.docstring = ""
+
+        except Exception as e:
+            logger.error(f"Error setting component details: {e}")
+
+    def _get_source_between_locations(self, file_path: str, start_line: int, end_line: int) -> str:
+        """Extract source code between two line numbers."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                # Convert to 0-based indexing
+                return ''.join(lines[start_line-1:end_line])
+        except Exception as e:
+            logger.error(f"Error reading source code: {e}")
+            return ""
+
+    def _extract_component(self, cursor, file_path: str, relative_path: str) -> Optional[Dict[str, Any]]:
+        """Extract component information from a clang cursor."""
+        if not cursor.extent.start.file or cursor.extent.start.file.name != file_path:
+            return None
+            
+        start_line = cursor.extent.start.line
+        end_line = cursor.extent.end.line
+        
+        # Get the source code
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        source_code = ''.join(lines[start_line-1:end_line])
+        
+        # Get component type and ID
+        if cursor.kind == CursorKind.CLASS_DECL:
+            comp_type = "class"
+            comp_id = f"{relative_path}::{cursor.spelling}::CLASS_DECL"
+        elif cursor.kind == CursorKind.CXX_METHOD:
+            comp_type = "method"
+            parent = cursor.semantic_parent
+            class_name = parent.spelling if parent else ""
+            comp_id = f"{relative_path}::{class_name}::{cursor.spelling}::CXX_METHOD"
+        elif cursor.kind == CursorKind.CONSTRUCTOR:
+            comp_type = "method"
+            parent = cursor.semantic_parent
+            class_name = parent.spelling if parent else ""
+            comp_id = f"{relative_path}::{class_name}::{cursor.spelling}::CONSTRUCTOR"
+        elif cursor.kind == CursorKind.FUNCTION_DECL:
+            comp_type = "function"
+            comp_id = f"{relative_path}::{cursor.spelling}::FUNCTION_DECL"
+        else:
+            return None
+            
+        # Extract existing docstring if present
+        docstring = None
+        tokens = list(cursor.get_tokens())
+        for i, token in enumerate(tokens):
+            if token.kind == TokenKind.COMMENT:
+                comment = token.spelling
+                if comment.startswith('/**') and comment.endswith('*/'):
+                    docstring = comment
+                    
+        return {
+            "id": comp_id,
+            "type": comp_type,
+            "source_code": source_code,
+            "start_line": start_line,
+            "end_line": end_line,
+            "docstring": docstring
+        }
+
+# Add this function to allow import from other modules
+from src.dependency_analyzer.cpp_parser import CppParser
+
+def parse_cpp_file(file_path: str, repo_path: str = None):
+    """
+    Parse a C++ file and return its components as a dictionary.
+    This is a wrapper for CppParser for compatibility with code expecting a parse_cpp_file function.
+    If repo_path is not provided, it will use the directory of the file_path.
+    """
+    if repo_path is None:
+        repo_path = os.path.dirname(file_path)
+    parser = CppParser(repo_path)
+    return parser.parse_file(file_path)

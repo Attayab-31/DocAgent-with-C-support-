@@ -1,9 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 """
-AST-based Python code parser that extracts dependency information between code components.
-
-This module identifies imports and references between Python code components (functions, classes, methods)
-and builds a dependency graph for topological sorting.
+AST-based code parser that extracts dependency information between code components.
+Supports both Python and C++ code components.
 """
 
 import ast
@@ -16,9 +14,10 @@ from typing import Dict, List, Set, Optional, Any, Union, TypeVar
 from pathlib import Path
 
 try:
-    from .cpp_parser import CppParser
+    from .cpp_parser import CppParser, CLANG_AVAILABLE
 except ImportError:
     CppParser = None
+    CLANG_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -33,71 +32,49 @@ EXCLUDED_NAMES = {'self', 'cls'}
 
 @dataclass
 class CodeComponent:
-    """
-    Represents a single code component (function, class, or method) in a Python codebase.
-    
-    Stores the component's identifier, AST node, dependencies, and other metadata.
-    """
-    # Unique identifier for the component, format: module_path.ClassName.method_name
+    """Base class for code components (functions, classes, methods)."""
     id: str
-    
-    # AST node representing this component
-    node: ast.AST
-    
-    # Type of component: 'class', 'function', or 'method'
-    component_type: str
-    
-    # Full path to the file containing this component
+    component_type: str  # "function", "class", or "method"
     file_path: str
-    
-    # Relative path within the repo
     relative_path: str
-    
-    # Set of component IDs this component depends on
+    source_code: str = ""
     depends_on: Set[str] = field(default_factory=set)
-    
-    # Original source code of the component
-    source_code: Optional[str] = None
-    
-    # Line numbers in the file (1-indexed)
     start_line: int = 0
     end_line: int = 0
-    
-    # Whether the component already has a docstring
     has_docstring: bool = False
-    
-    # Content of the docstring if it exists, empty string otherwise
     docstring: str = ""
-
+    language: str = "python"  # Can be "python" or "cpp"
+    
     def to_dict(self) -> Dict[str, Any]:
-        """Convert this component to a dictionary representation for JSON serialization."""
         return {
-            'id': self.id,
-            'component_type': self.component_type,
-            'file_path': self.file_path,
-            'relative_path': self.relative_path,
-            'depends_on': list(self.depends_on),
-            'start_line': self.start_line,
-            'end_line': self.end_line,
-            'has_docstring': self.has_docstring,
-            'docstring': self.docstring
+            "id": self.id,
+            "component_type": self.component_type,
+            "file_path": self.file_path,
+            "relative_path": self.relative_path,
+            "depends_on": list(self.depends_on),
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "has_docstring": self.has_docstring,
+            "docstring": self.docstring,
+            "language": self.language,
+            "source_code": self.source_code
         }
-
-    @staticmethod
-    def from_dict(data: Dict[str, Any]) -> 'CodeComponent':
-        """Create a CodeComponent from a dictionary representation."""
-        component = CodeComponent(
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'CodeComponent':
+        component = cls(
             id=data['id'],
-            node=None,  # AST node is not serialized
             component_type=data['component_type'],
             file_path=data['file_path'],
-            relative_path=data['relative_path'],
-            depends_on=set(data.get('depends_on', [])),
-            start_line=data.get('start_line', 0),
-            end_line=data.get('end_line', 0),
-            has_docstring=data.get('has_docstring', False),
-            docstring=data.get('docstring', "")
+            relative_path=data['relative_path']
         )
+        component.depends_on = set(data['depends_on'])
+        component.start_line = data['start_line']
+        component.end_line = data['end_line']
+        component.has_docstring = data['has_docstring']
+        component.docstring = data['docstring']
+        component.language = data.get('language', 'python')
+        component.source_code = data.get('source_code', '')
         return component
 
 
@@ -319,202 +296,140 @@ def add_parent_to_nodes(tree: ast.AST) -> None:
 
 
 class DependencyParser:
-    """
-    Parses code to build a dependency graph between components.
-    Currently supports Python and C++ files.
-    """
+    """Parses code to build a dependency graph between components."""
     
     def __init__(self, repo_path: str):
-        self.repo_path = os.path.abspath(repo_path)
-        self.components: Dict[str, Any] = {}
-        self.dependency_graph: Dict[str, List[str]] = {}
-        self.modules: Set[str] = set()
+        self.repo_path = repo_path
+        self.components: Dict[str, CodeComponent] = {}
+        self.cpp_parser = CppParser(repo_path) if CLANG_AVAILABLE else None
         
-        # Initialize C++ parser if available
-        self.cpp_parser = None
-        try:
-            from .cpp_parser import CppParser
-            self.cpp_parser = CppParser(repo_path)
-        except ImportError:
-            logger.warning("C++ parser not available. Install clang to enable C++ support.")
+    def parse_file(self, file_path: str) -> List[CodeComponent]:
+        """Parse a file and extract code components with their dependencies."""
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return []
             
-    def _file_to_module_path(self, relative_path: str) -> str:
-        """
-        Convert a file path to a Python module path.
+        relative_path = os.path.relpath(file_path, self.repo_path)
+        module_path = os.path.splitext(relative_path)[0].replace(os.sep, '.')
         
-        Args:
-            relative_path: The relative path of the file from the repository root
-            
-        Returns:
-            The Python module path (e.g., 'foo.bar.baz' for 'foo/bar/baz.py')
-        """
-        # Convert path separators to dots and remove the file extension
-        module_path = relative_path.replace('/', '.').replace('\\', '.').rsplit('.', 1)[0]
-        return module_path
-
-    def parse_repository(self):
-        """
-        Parse all Python and C++ files in the repository to build the dependency graph.
-        """
-        python_files = 0
-        cpp_files = 0
-        python_components = 0
-        cpp_components = 0
-        
-        for root, _, files in os.walk(self.repo_path):
-            for file in files:
-                if file.endswith(('.py', '.cpp', '.hpp', '.h', '.cxx', '.cc')):
-                    file_path = os.path.join(root, file)
-                    relative_path = os.path.relpath(file_path, self.repo_path)
-                    
-                    # Skip __pycache__ directories
-                    if '__pycache__' in relative_path:
-                        continue
-                    
-                    module_path = relative_path.replace('/', '.').replace('\\', '.').rsplit('.', 1)[0]
-                    
-                    try:
-                        # Parse Python files
-                        if file.endswith('.py'):
-                            python_files += 1
-                            old_count = len(self.components)
-                            self._parse_python_file(file_path, relative_path, module_path)
-                            # Count new Python components from this file
-                            python_components += len(self.components) - old_count
-                            
-                        # Parse C++ files if parser is available
-                        elif self.cpp_parser and file.endswith(('.cpp', '.hpp', '.h', '.cxx', '.cc')):
-                            cpp_files += 1
-                            old_count = len(self.components)
-                            new_components = self.cpp_parser.parse_file(file_path)
-                            self.components.update(new_components)
-                            cpp_components += len(new_components)
-                    except Exception as e:
-                        logger.warning(f"Error parsing {file_path}: {e}")
-        
-        logger.info(f"Parsed {python_files} Python files ({python_components} components) and "
-                    f"{cpp_files} C++ files ({cpp_components} components)")
-        
-        # After collecting all components, resolve dependencies
-        self._resolve_all_dependencies()
-        return self.components
-
-    def _parse_python_file(self, file_path: str, relative_path: str, module_path: str):
-        """Parse a Python file to collect code components."""
+        # Handle C++ files
+        if file_path.endswith(('.cpp', '.hpp', '.h', '.cc', '.cxx')):
+            if not CLANG_AVAILABLE:
+                logger.error("Clang not available - skipping C++ file")
+                return []
+                
+            try:
+                components = []
+                parsed_components = self.cpp_parser.parse_file(file_path, self.repo_path)
+                for comp in parsed_components:
+                    component = CodeComponent(
+                        id=comp['id'],
+                        component_type=comp['type'],
+                        file_path=file_path,
+                        relative_path=relative_path,
+                        source_code=comp['source_code'],
+                        start_line=comp['start_line'],
+                        end_line=comp['end_line'],
+                        language="cpp"
+                    )
+                    if 'docstring' in comp:
+                        component.has_docstring = True
+                        component.docstring = comp['docstring']
+                    components.append(component)
+                    self.components[component.id] = component
+                return components
+                
+            except Exception as e:
+                logger.error(f"Error parsing C++ file {file_path}: {str(e)}")
+                return []
+                
+        # Handle Python files
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 source = f.read()
-            
             tree = ast.parse(source)
-            
-            # Add parent field to AST nodes for easier traversal
-            add_parent_to_nodes(tree)
-            
-            # Collect imports
-            import_collector = ImportCollector()
-            import_collector.visit(tree)
-            
-            # Collect code components
-            self._collect_components(tree, file_path, relative_path, module_path, source)
-            
-        except (SyntaxError, UnicodeDecodeError) as e:
-            logger.warning(f"Error parsing {file_path}: {e}")
+            return self._collect_components(tree, file_path, relative_path, module_path, source)
+        except Exception as e:
+            logger.error(f"Error parsing Python file {file_path}: {str(e)}")
+            return []
     
-    def _collect_components(self, tree: ast.AST, file_path: str, relative_path: str, 
-                          module_path: str, source: str):
-        """Collect all code components (functions, classes, methods) from an AST."""
+    def _collect_components(self, tree: ast.AST, file_path: str, relative_path: str, module_path: str, source: str) -> List[CodeComponent]:
+        """Collect code components from an AST."""
+        components = []
+        
         for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                # Class definition
-                class_id = f"{module_path}.{node.name}"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Skip __init__ methods as they typically don't need separate docs
+                if node.name == '__init__':
+                    continue
+                    
+                # Get the source code lines
+                start_line = node.lineno
+                end_line = node.end_lineno if hasattr(node, 'end_lineno') else start_line
+                source_lines = source.splitlines()[start_line-1:end_line]
+                component_source = '\n'.join(source_lines)
                 
-                # Check if the class has a docstring
-                has_docstring = (
-                    len(node.body) > 0 
-                    and isinstance(node.body[0], ast.Expr) 
-                    and isinstance(node.body[0].value, ast.Constant)
-                    and isinstance(node.body[0].value.value, str)
+                # Check if it's a method or standalone function
+                parent_class = None
+                for parent in ast.walk(tree):
+                    if isinstance(parent, ast.ClassDef) and node in parent.body:
+                        parent_class = parent
+                        break
+                
+                if parent_class:
+                    # It's a method
+                    comp_id = f"{module_path}.{parent_class.name}.{node.name}"
+                    comp_type = "method"
+                else:
+                    # It's a function
+                    comp_id = f"{module_path}.{node.name}"
+                    comp_type = "function"
+                    
+                component = CodeComponent(
+                    id=comp_id,
+                    component_type=comp_type,
+                    file_path=file_path,
+                    relative_path=relative_path,
+                    source_code=component_source,
+                    start_line=start_line,
+                    end_line=end_line
                 )
                 
-                # Extract docstring if it exists
-                docstring = self._get_docstring(source, node) if has_docstring else ""
+                # Check for existing docstring
+                docstring = ast.get_docstring(node)
+                if docstring:
+                    component.has_docstring = True
+                    component.docstring = docstring
+                    
+                components.append(component)
                 
+            elif isinstance(node, ast.ClassDef):
+                # Get the source code lines
+                start_line = node.lineno
+                end_line = node.end_lineno if hasattr(node, 'end_lineno') else start_line
+                source_lines = source.splitlines()[start_line-1:end_line]
+                component_source = '\n'.join(source_lines)
+                
+                comp_id = f"{module_path}.{node.name}"
                 component = CodeComponent(
-                    id=class_id,
-                    node=node,
+                    id=comp_id,
                     component_type="class",
                     file_path=file_path,
                     relative_path=relative_path,
-                    source_code=self._get_source_segment(source, node),
-                    start_line=node.lineno,
-                    end_line=getattr(node, "end_lineno", node.lineno),
-                    has_docstring=has_docstring,
-                    docstring=docstring
+                    source_code=component_source,
+                    start_line=start_line,
+                    end_line=end_line
                 )
                 
-                self.components[class_id] = component
+                # Check for existing docstring
+                docstring = ast.get_docstring(node)
+                if docstring:
+                    component.has_docstring = True
+                    component.docstring = docstring
+                    
+                components.append(component)
                 
-                # Collect methods within the class
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        method_id = f"{class_id}.{item.name}"
-                        
-                        # Check if the method has a docstring
-                        method_has_docstring = (
-                            len(item.body) > 0 
-                            and isinstance(item.body[0], ast.Expr) 
-                            and isinstance(item.body[0].value, ast.Constant)
-                            and isinstance(item.body[0].value.value, str)
-                        )
-                        
-                        # Extract docstring if it exists
-                        method_docstring = self._get_docstring(source, item) if method_has_docstring else ""
-                        
-                        method_component = CodeComponent(
-                            id=method_id,
-                            node=item,
-                            component_type="method",
-                            file_path=file_path,
-                            relative_path=relative_path,
-                            source_code=self._get_source_segment(source, item),
-                            start_line=item.lineno,
-                            end_line=getattr(item, "end_lineno", item.lineno),
-                            has_docstring=method_has_docstring,
-                            docstring=method_docstring
-                        )
-                        
-                        self.components[method_id] = method_component
-            
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Only collect top-level functions
-                if hasattr(node, 'parent') and isinstance(node.parent, ast.Module):
-                    func_id = f"{module_path}.{node.name}"
-                    
-                    # Check if the function has a docstring
-                    has_docstring = (
-                        len(node.body) > 0 
-                        and isinstance(node.body[0], ast.Expr) 
-                        and isinstance(node.body[0].value, ast.Constant)
-                        and isinstance(node.body[0].value.value, str)
-                    )
-                    
-                    # Extract docstring if it exists
-                    docstring = self._get_docstring(source, node) if has_docstring else ""
-                    
-                    component = CodeComponent(
-                        id=func_id,
-                        node=node,
-                        component_type="function",
-                        file_path=file_path,
-                        relative_path=relative_path,
-                        source_code=self._get_source_segment(source, node),
-                        start_line=node.lineno,
-                        end_line=getattr(node, "end_lineno", node.lineno),
-                        has_docstring=has_docstring,
-                        docstring=docstring
-                    )
-                    
-                    self.components[func_id] = component
+        return components
     
     def _resolve_dependencies(self):
         """
@@ -812,49 +727,17 @@ class DependencyParser:
         # For example, Python code calling C++ extensions or via ctypes/cffi
         logger.info("Cross-language dependency analysis not yet implemented")
     
-    def parse_repository(self):
-        """
-        Parse all Python and C++ files in the repository to build the dependency graph.
-        """
-        python_files = 0
-        cpp_files = 0
-        python_components = 0
-        cpp_components = 0
-        
+    def parse_repository(self) -> Dict[str, CodeComponent]:
+        """Parse all Python and C++ files in the repository."""
         for root, _, files in os.walk(self.repo_path):
             for file in files:
-                if file.endswith(('.py', '.cpp', '.hpp', '.h', '.cxx', '.cc')):
+                if file.endswith(('.py', '.cpp', '.hpp', '.h', '.cc', '.cxx')):
                     file_path = os.path.join(root, file)
-                    relative_path = os.path.relpath(file_path, self.repo_path)
-                    
-                    # Skip __pycache__ directories
-                    if '__pycache__' in relative_path:
-                        continue
-                    
-                    module_path = relative_path.replace('/', '.').replace('\\', '.').rsplit('.', 1)[0]
-                    
                     try:
-                        # Parse Python files
-                        if file.endswith('.py'):
-                            python_files += 1
-                            old_count = len(self.components)
-                            self._parse_python_file(file_path, relative_path, module_path)
-                            # Count new Python components from this file
-                            python_components += len(self.components) - old_count
-                            
-                        # Parse C++ files if parser is available
-                        elif self.cpp_parser and file.endswith(('.cpp', '.hpp', '.h', '.cxx', '.cc')):
-                            cpp_files += 1
-                            old_count = len(self.components)
-                            new_components = self.cpp_parser.parse_file(file_path)
-                            self.components.update(new_components)
-                            cpp_components += len(new_components)
+                        components = self.parse_file(file_path)
+                        for component in components:
+                            self.components[component.id] = component
                     except Exception as e:
-                        logger.warning(f"Error parsing {file_path}: {e}")
-        
-        logger.info(f"Parsed {python_files} Python files ({python_components} components) and "
-                    f"{cpp_files} C++ files ({cpp_components} components)")
-        
-        # After collecting all components, resolve dependencies
-        self._resolve_all_dependencies()
+                        logger.error(f"Error parsing {file_path}: {str(e)}")
+                        continue
         return self.components
