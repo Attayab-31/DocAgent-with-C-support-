@@ -1,2 +1,11 @@
 config/agent_config.yaml
 tool/add_header.sh
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+output/dependency_graphs/*.json
+.pytest_cache/
+.coverage
+htmlcov/

@@ -1,5 +1,0 @@
-agent
-dependency_analyzer
-evaluator
-visualizer
-web

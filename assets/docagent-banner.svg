@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title desc">
+  <title id="title">DocAgent</title>
+  <desc id="desc">Context-aware docstring generation guided by repository structure and reviewed by specialized agents.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101b35"/>
+      <stop offset="1" stop-color="#173e5b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#61d6c4"/>
+      <stop offset="1" stop-color="#82b8ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="300" rx="28" fill="url(#bg)"/>
+  <circle cx="1030" cy="150" r="126" fill="#ffffff" opacity=".035"/>
+  <circle cx="1030" cy="150" r="94" fill="none" stroke="#82b8ff" stroke-width="2" opacity=".35"/>
+  <g fill="none" stroke="url(#accent)" stroke-width="3" opacity=".95">
+    <path d="M962 104 1028 150 1094 104M962 196 1028 150 1094 196"/>
+    <path d="M962 104v92M1094 104v92" opacity=".55"/>
+  </g>
+  <g fill="#132740" stroke="#83d8d0" stroke-width="2">
+    <rect x="935" y="86" width="54" height="36" rx="10"/>
+    <rect x="1001" y="132" width="54" height="36" rx="10"/>
+    <rect x="1067" y="86" width="54" height="36" rx="10"/>
+    <rect x="935" y="178" width="54" height="36" rx="10"/>
+    <rect x="1067" y="178" width="54" height="36" rx="10"/>
+  </g>
+  <g fill="#c8fff3">
+    <circle cx="962" cy="104" r="4"/><circle cx="1028" cy="150" r="4"/><circle cx="1094" cy="104" r="4"/>
+    <circle cx="962" cy="196" r="4"/><circle cx="1094" cy="196" r="4"/>
+  </g>
+  <text x="76" y="125" fill="#ffffff" font-family="Segoe UI, Arial, sans-serif" font-size="64" font-weight="700" letter-spacing="-1">DocAgent</text>
+  <rect x="78" y="151" width="86" height="5" rx="3" fill="url(#accent)"/>
+  <text x="78" y="199" fill="#d4e5f2" font-family="Segoe UI, Arial, sans-serif" font-size="23">Context-aware documentation for codebases</text>
+  <text x="78" y="237" fill="#8faec4" font-family="Segoe UI, Arial, sans-serif" font-size="16" letter-spacing="2">ANALYZE  ·  GENERATE  ·  VERIFY</text>
+</svg>
